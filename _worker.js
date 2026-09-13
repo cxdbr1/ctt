@@ -6,6 +6,7 @@ let AI_AD_REVIEW_ENABLED;
 
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
+const PRODUCTION_WEBHOOK_URL = 'https://ctt-ayy.pages.dev/webhook';
 let isInitialized = false;
 const processedMessages = new Set();
 const processedCallbacks = new Set();
@@ -92,18 +93,17 @@ export default {
     async function initialize(d1, request) {
       await Promise.all([
         checkAndRepairTables(d1),
-        autoRegisterWebhook(request),
+        autoRegisterWebhook(),
         checkBotPermissions(),
         cleanExpiredVerificationCodes(d1)
       ]);
     }
 
-    async function autoRegisterWebhook(request) {
-      const webhookUrl = `${new URL(request.url).origin}/webhook`;
+    async function autoRegisterWebhook() {
       await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: webhookUrl }),
+        body: JSON.stringify({ url: PRODUCTION_WEBHOOK_URL }),
       });
     }
 
@@ -179,6 +179,12 @@ export default {
           columns: {
             key: 'TEXT PRIMARY KEY',
             value: 'TEXT'
+          }
+        },
+        processed_updates: {
+          columns: {
+            update_key: 'TEXT PRIMARY KEY',
+            created_at: 'INTEGER NOT NULL'
           }
         }
       };
@@ -265,11 +271,18 @@ export default {
         const messageId = update.message.message_id.toString();
         const chatId = update.message.chat.id.toString();
         const messageKey = `${chatId}:${messageId}`;
-        
+
         if (processedMessages.has(messageKey)) {
           return;
         }
         processedMessages.add(messageKey);
+
+        const claim = await env.D1.prepare(
+          'INSERT OR IGNORE INTO processed_updates (update_key, created_at) VALUES (?, ?)'
+        ).bind(messageKey, Date.now()).run();
+        if (claim.meta?.changes === 0) {
+          return;
+        }
         
         if (processedMessages.size > 10000) {
           processedMessages.clear();
@@ -431,6 +444,11 @@ export default {
         return;
       }
 
+      if (AI_AD_REVIEW_ENABLED && await isAdvertisement(message, env)) {
+        await sendMessageToUser(chatId, '该消息疑似广告，未转发。');
+        return;
+      }
+
       const userInfo = await getUserInfo(chatId);
       if (!userInfo) {
         await sendMessageToUser(chatId, "无法获取用户信息，请稍后再试或联系管理员。");
@@ -452,11 +470,6 @@ export default {
           await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
           return;
         }
-      }
-
-      if (AI_AD_REVIEW_ENABLED && await isAdvertisement(message, env)) {
-        await sendMessageToUser(chatId, '该消息疑似广告，未转发。');
-        return;
       }
 
       const userName = userInfo.username || `User_${chatId}`;
@@ -1302,12 +1315,11 @@ export default {
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
     }
 
-    async function registerWebhook(request) {
-      const webhookUrl = `${new URL(request.url).origin}/webhook`;
+    async function registerWebhook() {
       const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: webhookUrl })
+        body: JSON.stringify({ url: PRODUCTION_WEBHOOK_URL })
       }).then(r => r.json());
       return new Response(response.ok ? 'Webhook set successfully' : JSON.stringify(response, null, 2));
     }
