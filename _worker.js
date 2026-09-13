@@ -299,7 +299,6 @@ export default {
             return;
           }
           if (privateChatId) {
-            if (AI_AD_REVIEW_ENABLED && await isAdvertisement(message, env)) { await sendMessageToUser(privateChatId, '该消息疑似广告，未转发。'); return; }
             await forwardMessageToPrivateChat(privateChatId, message);
           }
         }
@@ -453,6 +452,11 @@ export default {
           await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
           return;
         }
+      }
+
+      if (AI_AD_REVIEW_ENABLED && await isAdvertisement(message, env)) {
+        await sendMessageToUser(chatId, '该消息疑似广告，未转发。');
+        return;
       }
 
       const userName = userInfo.username || `User_${chatId}`;
