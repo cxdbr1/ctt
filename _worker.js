@@ -1080,7 +1080,10 @@ export default {
 
     async function isAdvertisement(message, env) {
       const text = [message.text, message.caption].filter(Boolean).join('\n');
-      if (!text || !env.OPENAI_API_URL || !env.OPENAI_API_KEY) return false;
+      if (!text) return false;
+      const obviousAd = /(加微信|加微|代理加盟|招商代理|优惠领取|领取优惠|返利|刷单|博彩|赌博|棋牌推广|色情推广|免费领取|扫码.*(加|领|优惠)|点击.*(购买|领取|咨询)|推广链接)/i.test(text);
+      if (obviousAd) return true;
+      if (!env.OPENAI_API_URL || !env.OPENAI_API_KEY) return false;
       const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), Math.max(500, parseInt(env.OPENAI_TIMEOUT_MS || '2500')));
       try { const r = await fetch(env.OPENAI_API_URL, { method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${env.OPENAI_API_KEY}`}, body:JSON.stringify({model:env.OPENAI_MODEL||'gpt-4o-mini',messages:[{role:'user',content:`Classify as advertisement. Reply only AD or OK.\n${text.slice(0,4000)}`}],max_tokens:2}),signal:controller.signal }); if (!r.ok) return false; const d=await r.json(); return String(d.choices?.[0]?.message?.content||'').trim().toUpperCase()==='AD'; } catch (_) { return false; } finally { clearTimeout(timer); }
     }
