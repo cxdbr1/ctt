@@ -1,6 +1,8 @@
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
+let CAPTCHA_TTL_SECONDS;
+let AI_AD_REVIEW_ENABLED;
 
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
@@ -50,6 +52,8 @@ export default {
     BOT_TOKEN = env.BOT_TOKEN_ENV || null;
     GROUP_ID = env.GROUP_ID_ENV || null;
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
+    CAPTCHA_TTL_SECONDS = Math.max(30, parseInt(env.CAPTCHA_TTL_SECONDS_ENV || '180'));
+    AI_AD_REVIEW_ENABLED = String(env.AI_AD_REVIEW_ENABLED_ENV || 'false').toLowerCase() === 'true';
 
     if (!env.D1) {
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
@@ -148,6 +152,7 @@ export default {
             is_verified: 'BOOLEAN DEFAULT FALSE',
             verified_expiry: 'INTEGER',
             verification_code: 'TEXT',
+            verification_nonce: 'TEXT',
             code_expiry: 'INTEGER',
             last_verification_message_id: 'TEXT',
             is_first_verification: 'BOOLEAN DEFAULT TRUE',
@@ -294,6 +299,7 @@ export default {
             return;
           }
           if (privateChatId) {
+            if (AI_AD_REVIEW_ENABLED && await isAdvertisement(message, env)) { await sendMessageToUser(privateChatId, '该消息疑似广告，未转发。'); return; }
             await forwardMessageToPrivateChat(privateChatId, message);
           }
         }
@@ -326,6 +332,14 @@ export default {
       } else {
         const nowSeconds = Math.floor(Date.now() / 1000);
         const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+        if (isVerified) {
+          const slidingExpiry = nowSeconds + (parseInt(env.VERIFIED_SESSION_TTL_SECONDS_ENV || '172800') || 172800);
+          if (slidingExpiry > userState.verified_expiry) {
+            userState.verified_expiry = slidingExpiry;
+            userStateCache.set(chatId, userState);
+            await env.D1.prepare('UPDATE user_states SET verified_expiry = ? WHERE chat_id = ?').bind(slidingExpiry, chatId).run();
+          }
+        }
         const isFirstVerification = userState.is_first_verification;
         const isRateLimited = await checkMessageRate(chatId);
         const isVerifying = userState.is_verifying || false;
@@ -739,14 +753,14 @@ export default {
       }
 
       if (action === 'verify') {
-        const [, userChatId, selectedAnswer, result] = data.split('_');
+        const [, userChatId, nonce, selectedAnswer] = data.split('_');
         if (userChatId !== chatId) {
           return;
         }
 
         let verificationState = userStateCache.get(chatId);
         if (verificationState === undefined) {
-          verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          verificationState = await env.D1.prepare('SELECT verification_code, verification_nonce, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
             .bind(chatId)
             .first();
           if (!verificationState) {
@@ -799,9 +813,9 @@ export default {
           return;
         }
 
-        if (result === 'correct') {
-          const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
+        if (storedCode && selectedAnswer === storedCode && await sha256(nonce + ':' + storedCode) === verificationState.verification_nonce) {
+          const verifiedExpiry = nowSeconds + (parseInt(env.VERIFIED_SESSION_TTL_SECONDS_ENV || '172800') || 172800);
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, verification_nonce = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
             .bind(true, verifiedExpiry, false, false, chatId)
             .run();
           verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_first_verification, is_verifying FROM user_states WHERE chat_id = ?')
@@ -986,26 +1000,40 @@ export default {
 
     async function sendVerification(chatId) {
       try {
-        const num1 = Math.floor(Math.random() * 10);
-        const num2 = Math.floor(Math.random() * 10);
-        const operation = Math.random() > 0.5 ? '+' : '-';
-        const correctResult = operation === '+' ? num1 + num2 : num1 - num2;
-
-        const options = new Set([correctResult]);
-        while (options.size < 4) {
-          const wrongResult = correctResult + Math.floor(Math.random() * 5) - 2;
-          if (wrongResult !== correctResult) options.add(wrongResult);
+        const kind = Math.floor(Math.random() * 3);
+        let question;
+        let correctResult;
+        let optionArray;
+        if (kind === 0) {
+          const num1 = Math.floor(Math.random() * 10);
+          const num2 = Math.floor(Math.random() * 10);
+          const operation = Math.random() > 0.5 ? '+' : '-';
+          correctResult = operation === '+' ? num1 + num2 : num1 - num2;
+          const options = new Set([correctResult]);
+          while (options.size < 4) options.add(correctResult + Math.floor(Math.random() * 5) - 2);
+          optionArray = Array.from(options).slice(0, 4).sort(() => Math.random() - 0.5);
+          question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
+        } else if (kind === 1) {
+          const truth = Math.random() < 0.5;
+          correctResult = truth ? '真' : '假';
+          optionArray = ['真', '假'];
+          question = `判断：${truth ? '太阳从东方升起' : '水的化学式是 CO₂'}（点击正确答案）`;
+        } else {
+          const sequence = ['1', '2', '3', '4'];
+          optionArray = [...sequence].sort(() => Math.random() - 0.5);
+          correctResult = sequence[1];
+          question = `请从下方按钮中选择升序排列后的第二个数字（原序列：${optionArray.join('、')}）`;
         }
-        const optionArray = Array.from(options).sort(() => Math.random() - 0.5);
 
+        const nonce = crypto.randomUUID().replaceAll('-', '');
         const buttons = optionArray.map(option => ({
           text: `(${option})`,
-          callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}`
+          callback_data: `verify_${chatId}_${nonce}_${option}`
         }));
 
-        const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
         const nowSeconds = Math.floor(Date.now() / 1000);
-        const codeExpiry = nowSeconds + 300;
+        const codeExpiry = nowSeconds + CAPTCHA_TTL_SECONDS;
+        const nonceHash = await sha256(nonce + ':' + correctResult.toString());
 
         let userState = userStateCache.get(chatId);
         if (userState === undefined) {
@@ -1034,6 +1062,7 @@ export default {
           await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
             .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
             .run();
+          await env.D1.prepare('UPDATE user_states SET verification_nonce = ? WHERE chat_id = ?').bind(nonceHash, chatId).run();
         } else {
           throw new Error(`Telegram API 返回错误: ${data.description || '未知错误'}`);
         }
@@ -1041,6 +1070,15 @@ export default {
         console.error(`发送验证码失败: ${error.message}`);
         throw error; // 向上传递错误以便调用方处理
       }
+    }
+
+    async function sha256(value) { const bytes = new TextEncoder().encode(value); const hash = await crypto.subtle.digest('SHA-256', bytes); return [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join(''); }
+
+    async function isAdvertisement(message, env) {
+      const text = [message.text, message.caption].filter(Boolean).join('\n');
+      if (!text || !env.OPENAI_API_URL || !env.OPENAI_API_KEY) return false;
+      const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), Math.max(500, parseInt(env.OPENAI_TIMEOUT_MS || '2500')));
+      try { const r = await fetch(env.OPENAI_API_URL, { method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${env.OPENAI_API_KEY}`}, body:JSON.stringify({model:env.OPENAI_MODEL||'gpt-4o-mini',messages:[{role:'user',content:`Classify as advertisement. Reply only AD or OK.\n${text.slice(0,4000)}`}],max_tokens:2}),signal:controller.signal }); if (!r.ok) return false; const d=await r.json(); return String(d.choices?.[0]?.message?.content||'').trim().toUpperCase()==='AD'; } catch (_) { return false; } finally { clearTimeout(timer); }
     }
 
     async function checkIfAdmin(userId) {
