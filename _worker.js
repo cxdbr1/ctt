@@ -18,6 +18,39 @@ const settingsCache = new Map([
   ['user_raw_enabled', null]
 ]);
 
+function normalizeAdvertisementText(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}_]+/gu, '');
+}
+
+function isObviousAdvertisementText(value) {
+  const text = String(value || '');
+  const normalized = normalizeAdvertisementText(text);
+  if (!normalized) return false;
+
+  if (/(加微信|加微|代理加盟|招商代理|优惠领取|领取优惠|返利|刷单|博彩|赌博|棋牌推广|色情推广|免费领取|扫码.*(加|领|优惠)|点击.*(购买|领取|咨询)|推广链接)/i.test(normalized)) {
+    return true;
+  }
+
+  if (!/(trx|usdt|转u|波场)/i.test(normalized)) return false;
+
+  const serviceSignals = [
+    /(能量|闪租|租赁)/i.test(normalized),
+    /(手续费|兑换|市场汇率)/i.test(normalized),
+    /(机器人|bot)/i.test(normalized)
+  ].filter(Boolean).length;
+  const promotionSignals = [
+    /(仅需|超值|免高额|无忧|秒到账|24小时|自动服务|专业平台|稳定高效|价格实惠|优惠)/i.test(normalized),
+    /@[a-z0-9_]{4,}/i.test(text)
+  ].filter(Boolean).length;
+
+  return serviceSignals >= 2 && promotionSignals >= 1;
+}
+
+export { isObviousAdvertisementText, normalizeAdvertisementText };
+
 class LRUCache {
   constructor(maxSize) {
     this.maxSize = maxSize;
@@ -1094,8 +1127,7 @@ export default {
     async function isAdvertisement(message, env) {
       const text = [message.text, message.caption].filter(Boolean).join('\n');
       if (!text) return false;
-      const obviousAd = /(加微信|加微|代理加盟|招商代理|优惠领取|领取优惠|返利|刷单|博彩|赌博|棋牌推广|色情推广|免费领取|扫码.*(加|领|优惠)|点击.*(购买|领取|咨询)|推广链接)/i.test(text);
-      if (obviousAd) return true;
+      if (isObviousAdvertisementText(text)) return true;
       if (!env.OPENAI_API_URL || !env.OPENAI_API_KEY) return false;
       const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), Math.max(500, parseInt(env.OPENAI_TIMEOUT_MS || '2500')));
       try { const r = await fetch(env.OPENAI_API_URL, { method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${env.OPENAI_API_KEY}`}, body:JSON.stringify({model:env.OPENAI_MODEL||'gpt-4o-mini',messages:[{role:'user',content:`Classify as advertisement. Reply only AD or OK.\n${text.slice(0,4000)}`}],max_tokens:2}),signal:controller.signal }); if (!r.ok) return false; const d=await r.json(); return String(d.choices?.[0]?.message?.content||'').trim().toUpperCase()==='AD'; } catch (_) { return false; } finally { clearTimeout(timer); }
