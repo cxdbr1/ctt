@@ -808,27 +808,25 @@ export default {
           return;
         }
 
-        let verificationState = userStateCache.get(chatId);
-        if (verificationState === undefined) {
-          verificationState = await env.D1.prepare('SELECT verification_code, verification_nonce, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          if (!verificationState) {
-            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
-          }
-          userStateCache.set(chatId, verificationState);
+        // Verification state is security-sensitive; always read the latest D1 row.
+        let verificationState = await env.D1.prepare('SELECT verification_code, verification_nonce, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        if (!verificationState) {
+          verificationState = { verification_code: null, verification_nonce: null, code_expiry: null, is_verifying: false };
         }
+        userStateCache.set(chatId, verificationState);
 
         const storedCode = verificationState.verification_code;
         const codeExpiry = verificationState.code_expiry;
         const nowSeconds = Math.floor(Date.now() / 1000);
 
-        if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
+        if (!storedCode || (codeExpiry && nowSeconds >= codeExpiry)) {
           await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
-          await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
+          await env.D1.prepare('UPDATE user_states SET verification_code = NULL, verification_nonce = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
             .bind(chatId)
             .run();
-          userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
+          userStateCache.set(chatId, { ...verificationState, verification_code: null, verification_nonce: null, code_expiry: null, is_verifying: false });
           
           // 删除旧的验证消息
           try {
@@ -994,6 +992,7 @@ export default {
         }
 
         userState.verification_code = null;
+        userState.verification_nonce = null;
         userState.code_expiry = null;
         userState.is_verifying = true;
         userStateCache.set(chatId, userState);
@@ -1087,9 +1086,10 @@ export default {
 
         let userState = userStateCache.get(chatId);
         if (userState === undefined) {
-          userState = { verification_code: correctResult.toString(), code_expiry: codeExpiry, last_verification_message_id: null, is_verifying: true };
+          userState = { verification_code: correctResult.toString(), verification_nonce: nonceHash, code_expiry: codeExpiry, last_verification_message_id: null, is_verifying: true };
         } else {
           userState.verification_code = correctResult.toString();
+          userState.verification_nonce = nonceHash;
           userState.code_expiry = codeExpiry;
           userState.last_verification_message_id = null;
           userState.is_verifying = true;
@@ -1109,10 +1109,11 @@ export default {
         if (data.ok) {
           userState.last_verification_message_id = data.result.message_id.toString();
           userStateCache.set(chatId, userState);
-          await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
-            .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
+          await env.D1.prepare('UPDATE user_states SET verification_code = ?, verification_nonce = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
+            .bind(correctResult.toString(), nonceHash, codeExpiry, data.result.message_id.toString(), true, chatId)
             .run();
-          await env.D1.prepare('UPDATE user_states SET verification_nonce = ? WHERE chat_id = ?').bind(nonceHash, chatId).run();
+          userState.verification_nonce = nonceHash;
+          userStateCache.set(chatId, userState);
         } else {
           throw new Error(`Telegram API 返回错误: ${data.description || '未知错误'}`);
         }
